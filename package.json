@@ -2,21 +2,24 @@
   "name": "spotify-backend",
   "version": "1.0.0",
   "description": "",
-    "main": "server.js",
-    "scripts": {
+  "main": "server.js",
+  "scripts": {
     "start": "node server.js"
-    },
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1056.0",
     "@aws-sdk/client-s3": "^3.1055.0",
     "@aws-sdk/client-sns": "^3.1055.0",
     "axios": "^1.16.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "jwks-rsa": "^4.0.1",
     "mongoose": "^9.6.3"
   }
 }

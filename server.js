@@ -2,22 +2,21 @@ const express = require('express');
 const cors = require('cors');
 const mongoose = require('mongoose');
 const axios = require('axios');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const jwt = require('jsonwebtoken');
+const jwksClient = require('jwks-rsa');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
+const { CloudWatchClient, PutMetricDataCommand } = require('@aws-sdk/client-cloudwatch');
 require('dotenv').config();
 
 const app = express();
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-// ==========================================
-// 1. DATABASE SETUP (MongoDB Atlas)
-// ==========================================
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log("🚀 MongoDB Atlas connected successfully!"))
-  .catch((err) => console.error("❌ MongoDB connection error:", err));
+  .then(() => console.log("MongoDB Atlas pipeline connected successfully!"))
+  .catch((err) => console.error("MongoDB connection target error:", err));
 
-// Schema to log every time a user triggers a backup sync
 const SyncLogSchema = new mongoose.Schema({
   userId: String,
   playlistName: String,
@@ -27,29 +26,60 @@ const SyncLogSchema = new mongoose.Schema({
 });
 const SyncLog = mongoose.model('SyncLog', SyncLogSchema);
 
-// ==========================================
-// 2. AWS HARDWARE CONNECTIONS (S3 & SNS)
-// ==========================================
 const awsConfig = {
   region: process.env.AWS_REGION,
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID,
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-    sessionToken: process.env.AWS_SESSION_TOKEN // Required for AWS Academy Labs
+    sessionToken: process.env.AWS_SESSION_TOKEN
   }
 };
 const s3Client = new S3Client(awsConfig);
 const snsClient = new SNSClient(awsConfig);
+const cloudwatchClient = new CloudWatchClient(awsConfig);
 
-// ==========================================
-// FUNCTIONALITY 1: LIVE SPOTIFY SEARCH
-// ==========================================
+const streamToString = (stream) =>
+  new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (chunk) => chunks.push(chunk));
+    stream.on("error", reject);
+    stream.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+  });
+
+const client = jwksClient({
+  jwksUri: `https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com`
+});
+
+function getKey(header, callback) {
+  client.getSigningKey(header.kid, function(err, key) {
+    var signingKey = key.publicKey || key.rsaPublicKey;
+    callback(null, signingKey);
+  });
+}
+
+const validateFirebaseToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: "Access Denied. Token missing." });
+  }
+  const token = authHeader.split(' ')[1];
+
+  jwt.verify(token, getKey, {
+    audience: "playlister-5e329",
+    issuer: `https://securetoken.google.com/playlister-5e329`,
+    algorithms: ['RS256']
+  }, (err, decodedToken) => {
+    if (err) return res.status(403).json({ error: "Invalid token verification." });
+    req.user = decodedToken;
+    next();
+  });
+};
+
 app.get('/api/search', async (req, res) => {
   const { query } = req.query;
-  if (!query) return res.status(400).json({ error: "Missing search text query" });
+  if (!query) return res.status(400).json({ error: "Missing query parameter." });
 
   try {
-    // A. Exchange Client ID & Secret for a temporary Spotify access token
     const tokenResponse = await axios.post(
       'https://accounts.spotify.com/api/token',
       'grant_type=client_credentials',
@@ -62,12 +92,10 @@ app.get('/api/search', async (req, res) => {
     );
     const spotifyToken = tokenResponse.data.access_token;
 
-    // B. Call Spotify search with the token
-    const searchResponse = await axios.get(`https://api.spotify.com/v1/search?q=${encodeURIComponent(query)}&type=track&limit=5`, {
+    const searchResponse = await axios.get(`https://api.spotify.com/v1/search?q=$${encodeURIComponent(query)}&type=track&limit=5`, {
       headers: { 'Authorization': `Bearer ${spotifyToken}` }
     });
 
-    // C. Clean up information to send to the frontend UI
     const tracks = searchResponse.data.tracks.items.map(track => ({
       id: track.id,
       title: track.name,
@@ -77,71 +105,137 @@ app.get('/api/search', async (req, res) => {
 
     res.json(tracks);
   } catch (error) {
-    console.error("Spotify API failure:", error.message);
-    res.status(500).json({ error: "Failed to pull music data from Spotify" });
+    res.status(500).json({ error: "Spotify data integration error." });
   }
 });
 
-// ==========================================
-// FUNCTIONALITY 2: MULTI-CLOUD SYNC & BACKUP
-// ==========================================
-app.post('/api/playlist/sync', async (req, res) => {
-  const { userId, playlistName, tracks } = req.body;
+app.post('/api/playlist/sync', validateFirebaseToken, async (req, res) => {
+  const { playlistName, tracks } = req.body;
+  const userId = req.user.user_id;
 
-  if (!userId || !playlistName || !tracks || !tracks.length) {
-    return res.status(400).json({ error: "Missing required app data payload parameters" });
+  if (!playlistName || !tracks || !tracks.length) {
+    return res.status(400).json({ error: "Malformed request payload parameters." });
   }
+
+  const startTime = Date.now();
 
   try {
     const fileName = `backups/user-${userId}/playlist-${Date.now()}.json`;
 
-    // CLOUD TARGET A: Amazon S3 (Save physical backup file)
     await s3Client.send(new PutObjectCommand({
       Bucket: process.env.S3_BUCKET_NAME,
       Key: fileName,
-      Body: JSON.stringify({ playlistName, tracks, syncedBy: userId }, null, 2),
+      Body: JSON.stringify({ playlistName, tracks, backedUpBy: userId }, null, 2),
       ContentType: 'application/json'
     }));
-    console.log("-> S3 File written successfully.");
 
-    // CLOUD TARGET B: MongoDB Atlas (Log structural database entry)
     const newLog = new SyncLog({
       userId,
       playlistName,
       trackCount: tracks.length,
       s3FileName: fileName
     });
-    const databaseRecord = await newLog.save();
-    console.log("-> MongoDB Transaction logged successfully.");
+    const savedLog = await newLog.save();
 
-    // CLOUD TARGET C: AWS SNS (Broadcast event notification)
-    const notificationText = `Success! Your app playlist "${playlistName}" has been safely backed up.\n\n` +
-                             `• Songs saved: ${tracks.length}\n` +
-                             `• Database Record ID: ${databaseRecord._id}\n` +
-                             `• S3 File Target: ${fileName}\n\n` +
-                             `All integrations are fully working!`;
+    const alertBody = `Success Notification Triggered!\n\n` +
+                      `• Playlist Target Saved: ${playlistName}\n` +
+                      `• Target Track Entries Count: ${tracks.length}\n` +
+                      `• DB Object ID: ${savedLog._id}\n\n`;
 
     await snsClient.send(new PublishCommand({
       TopicArn: process.env.SNS_TOPIC_ARN,
-      Subject: "Cloud Music Pipeline Success",
-      Message: notificationText
+      Subject: "Cloud Music Stack Sync",
+      Message: alertBody
     }));
-    console.log("-> AWS SNS notification alert dispatched.");
 
-    // Send complete success confirmation back to browser
-    res.json({
-      success: true,
-      message: "Synced completely across MongoDB, S3, and SNS Notification!",
-      mongoId: databaseRecord._id,
-      s3Path: fileName
+    const durationMs = Date.now() - startTime; 
+
+    await cloudwatchClient.send(new PutMetricDataCommand({
+      Namespace: "MusicCuratorApp/Infrastructure",
+      MetricData: [
+        {
+          MetricName: "PipelineProcessingLatency",
+          Dimensions: [{ Name: "Environment", Value: "Production" }],
+          Unit: "Milliseconds",
+          Value: durationMs
+        }
+      ]
+    }));
+    console.log(`-> Telemetry logged to CloudWatch. Duration: ${durationMs}ms`);
+
+    res.json({ 
+      success: true, 
+      message: "Multi-Cloud Loop verified successfully.", 
+      mongoId: savedLog._id,
+      latency: durationMs
     });
-
   } catch (error) {
-    console.error("Core Pipeline error:", error);
-    res.status(500).json({ error: "Cloud sync failed to execute completely", details: error.message });
+    console.error(error);
+    res.status(500).json({ error: "Cloud sync pipeline trace error." });
   }
 });
 
-// Run Backend Server Locally
+app.get('/api/history', validateFirebaseToken, async (req, res) => {
+  try {
+    const records = await SyncLog.find({ userId: req.user.user_id }).sort({ timestamp: -1 });
+    res.json(records);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load database logs." });
+  }
+});
+
+app.get('/api/analytics', validateFirebaseToken, async (req, res) => {
+  try {
+    const userId = req.user.user_id;
+    const pipelineResult = await SyncLog.aggregate([
+      { $match: { userId: userId } },
+      {
+        $group: {
+          _id: "$userId",
+          totalSyncs: { $sum: 1 },
+          totalTracksBackedUp: { $sum: "$trackCount" },
+          favoritePlaylist: { $first: "$playlistName" }
+        }
+      }
+    ]);
+    const metrics = pipelineResult[0] || { totalSyncs: 0, totalTracksBackedUp: 0, favoritePlaylist: "N/A" };
+    res.json(metrics);
+  } catch (err) {
+    res.status(500).json({ error: "Aggregation pipeline trace failure." });
+  }
+});
+
+app.get('/api/history/restore/:id', validateFirebaseToken, async (req, res) => {
+  try {
+    const record = await SyncLog.findOne({ _id: req.params.id, userId: req.user.user_id });
+    if (!record) return res.status(404).json({ error: "Backup target not found." });
+
+    const s3Response = await s3Client.send(new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: record.s3FileName
+    }));
+
+    const rawFileContent = await streamToString(s3Response.Body);
+    const backupData = JSON.parse(rawFileContent);
+
+    res.json({
+      success: true,
+      playlistName: backupData.playlistName,
+      tracks: backupData.tracks
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to pull data from S3." });
+  }
+});
+
+app.delete('/api/history/:id', validateFirebaseToken, async (req, res) => {
+  try {
+    await SyncLog.deleteOne({ _id: req.params.id, userId: req.user.user_id });
+    res.json({ success: true, message: "Dropped record successfully." });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to execute deletion trace." });
+  }
+});
+
 const PORT = 5000;
-app.listen(PORT, () => console.log(`🎯 Local compute active on port ${PORT}`));
+app.listen(PORT, () => console.log(` Compute server running on port ${PORT}`));
